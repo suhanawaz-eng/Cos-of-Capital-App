@@ -2,6 +2,8 @@
 from datetime import datetime, timezone, date
 from urllib.parse import quote
 from io import BytesIO, StringIO
+import json
+from pathlib import Path
 import re
 import html
 import unicodedata
@@ -19,11 +21,13 @@ BETA_HTML = "https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/Betas.
 RATINGS = "https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/ratings.html"
 BONDS = "https://tradingeconomics.com/country-list/government-bond-10y"
 BONDS_ALT = "https://tradingeconomics.com/bonds"
+BONDS_BACKUP = "https://countryeconomy.com/bonds"
+CACHE_FILE = Path(__file__).with_name("last_successful_yields.json")
 OECD = "https://www.oecd.org/en/publications/corporate-tax-statistics-2025_6a915941-en/full-report/component-6.html"
 OECD_2024 = "https://www.oecd.org/en/publications/corporate-tax-statistics-2024_9c27d6e8-en/full-report/statutory-corporate-income-tax-rates_440f9286.html"
 
 
-OECD_DATA_API = "https://sdmx.oecd.org/public/rest/data/OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT,2.0/.A..ST..S13...?startPeriod=2023&dimensionAtObservation=AllDimensions&format=csvfile"
+OECD_DATA_API = "https://sdmx.oecd.org/public/rest/data/OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT,2.0/.A..ST..S13...?startPeriod=2023&dimensionAtObservation=AllDimensions"
 OECD_2026_REPORT = "https://www.oecd.org/en/publications/corporate-tax-statistics-2026_73af6222-en/full-report/statutory-corporate-income-tax-rates_ce84abb9.html"
 FRED_US = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10"
 FRED_CO = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=COLIRLTLT01STM"
@@ -163,25 +167,27 @@ def parse_yield_tables(tables):
 
 
 def parse_yield_html(page):
-    """Extract only explicit country + 10-year yield rows from public tables.
+    """Parse explicit country/last rows even when the HTML headers contain icons.
 
-    Avoid arbitrary page numbers, forecast values, and unrelated bond maturities.
+    Only accept a 10-year table with a recognizable country and last column.
     """
     soup = BeautifulSoup(page, "html.parser")
     out = {}
     for table in soup.select("table"):
         rows = table.select("tr")
-        header = []
-        for row in rows[:8]:
+        header_idx = None
+        ci = yi = None
+        for j, row in enumerate(rows[:12]):
             cells = row.find_all(["th", "td"], recursive=False)
-            vals = [norm(c.get_text(" ", strip=True)) for c in cells]
-            if "country" in vals and "last" in vals:
-                header = vals
+            labels = [norm(c.get_text(" ", strip=True)) for c in cells]
+            country_col = next((i for i, x in enumerate(labels) if x == "country" or x.startswith("country ")), None)
+            yield_col = next((i for i, x in enumerate(labels) if x == "last" or x.startswith("last ")), None)
+            if country_col is not None and yield_col is not None:
+                header_idx, ci, yi = j, country_col, yield_col
                 break
-        if not header:
+        if header_idx is None:
             continue
-        ci, yi = header.index("country"), header.index("last")
-        for row in rows:
+        for row in rows[header_idx+1:]:
             cells = row.find_all(["td", "th"], recursive=False)
             if len(cells) <= max(ci, yi):
                 continue
@@ -190,24 +196,58 @@ def parse_yield_html(page):
                 continue
             try:
                 val = numeric(cells[yi].get_text(" ", strip=True))
-                if -5 < val < 75:
-                    out[name] = val
-            except (TypeError, ValueError):
+            except (ValueError, TypeError):
                 continue
+            if -5 < val < 75:
+                out[name] = val
     return out
 
 
-def parse_te_reference_dates(page):
-    """Read the country table's Reference column, if provided."""
+def parse_backup_bonds(page):
+    """CountryEconomy explicitly labels 10-year yields and observation dates."""
     soup = BeautifulSoup(page, "html.parser")
-    dates = {}
+    values, dates = {}, {}
     for table in soup.select("table"):
-        for row in table.select("tr"):
-            cells = row.find_all(["th", "td"], recursive=False)
-            values = [c.get_text(" ", strip=True) for c in cells]
-            if len(values) >= 4 and values[0] in CURRENCIES and re.fullmatch(r"[A-Za-z]{3}/\d{2,4}", values[3]):
-                dates[values[0]] = values[3]
-    return dates
+        for tr in table.select("tr"):
+            cells = tr.find_all(["td", "th"], recursive=False)
+            if len(cells) < 3:
+                continue
+            country = cells[0].get_text(" ", strip=True).replace(" [+]", "").strip()
+            country = re.sub(r"\s*\[\+\]\s*$", "", country)
+            if country not in CURRENCIES:
+                continue
+            date_text = cells[1].get_text(" ", strip=True)
+            yield_text = cells[2].get_text(" ", strip=True)
+            if not re.search(r"\d{1,2}/\d{1,2}/\d{4}", date_text):
+                continue
+            try:
+                val = numeric(yield_text)
+            except (ValueError, TypeError):
+                continue
+            if -5 < val < 75:
+                values[country] = val
+                dates[country] = date_text
+    return values, dates
+
+
+def read_last_successful_yields():
+    try:
+        obj = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        values = obj.get("values", {})
+        meta = obj.get("meta", {})
+        if not isinstance(values, dict) or not isinstance(meta, dict):
+            return {}, {}
+        return {k: float(v) for k,v in values.items() if k in CURRENCIES and -5 < float(v) < 75}, meta
+    except (OSError, ValueError, TypeError):
+        return {}, {}
+
+
+def save_last_successful_yields(values, meta):
+    # Best effort: Streamlit Community Cloud local disk is ephemeral.
+    try:
+        CACHE_FILE.write_text(json.dumps({"values":values,"meta":meta}), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def parse_fred_csv(content, series_id):
@@ -227,10 +267,7 @@ def parse_fred_csv(content, series_id):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_yields():
-    """Trading Economics public table first; independent FRED fallback for US/CO.
-
-    Return observation date when known; never confuse retrieval time with it.
-    """
+    """Try public live tables, then dated fallback; never present a snapshot as live."""
     errors = []
     values, meta = {}, {}
     checked = datetime.now(timezone.utc).isoformat(timespec="minutes")
@@ -239,25 +276,55 @@ def load_yields():
             page = get(url).text
             parsed = parse_yield_html(page)
             if len(parsed) < 5:
-                parsed.update(parse_yield_tables(_as_tables(page)))
+                try:
+                    parsed.update(parse_yield_tables(_as_tables(page)))
+                except Exception as e:
+                    errors.append(f"{url}: table parser {type(e).__name__}: {e}")
             if parsed:
-                reference_dates = parse_te_reference_dates(page)
+                refs = parse_te_reference_dates(page)
                 for name, val in parsed.items():
                     values[name] = val
-                    meta[name] = {"source":"Trading Economics", "observed":reference_dates.get(name, "See source reference column"), "url":url, "retrieved":checked}
+                    meta[name] = {"source":"Trading Economics", "observed":refs.get(name, "Source reference not provided"), "url":url, "retrieved":checked, "status":"Retrieved"}
                 break
-            errors.append(f"{url}: no country/yield table found")
+            errors.append(f"{url}: no explicit 10-year country/last table found")
         except Exception as e:
             errors.append(f"{url}: {type(e).__name__}: {e}")
+    # An independently published 10-year bond table, without an API key.
+    if "United States" not in values or "Colombia" not in values:
+        try:
+            backup, dates = parse_backup_bonds(get(BONDS_BACKUP).text)
+            for name, val in backup.items():
+                if name not in values:
+                    values[name] = val
+                    meta[name] = {"source":"CountryEconomy (10-year bonds)", "observed":dates.get(name,"Unknown"), "url":BONDS_BACKUP, "retrieved":checked, "status":"Retrieved"}
+            if not backup:
+                errors.append("CountryEconomy: no dated 10-year bond rows recognized")
+        except Exception as e:
+            errors.append(f"CountryEconomy: {type(e).__name__}: {e}")
+    # FRED only for the two documented series; keep timeouts bounded.
     for name, series, url in (("United States", "DGS10", FRED_US), ("Colombia", "COLIRLTLT01STM", FRED_CO)):
         if name in values:
             continue
         try:
             value, observed = parse_fred_csv(get(url).text, series)
             values[name] = value
-            meta[name] = {"source":f"FRED ({series}; US Treasury/OECD)", "observed":observed, "url":url, "retrieved":checked}
+            meta[name] = {"source":f"FRED ({series})", "observed":observed, "url":url, "retrieved":checked, "status":"Retrieved"}
         except Exception as e:
             errors.append(f"FRED {series}: {type(e).__name__}: {e}")
+    if values:
+        save_last_successful_yields(values, meta)
+    cached_values, cached_meta = read_last_successful_yields()
+    for name, val in cached_values.items():
+        if name not in values:
+            values[name] = val
+            old = cached_meta.get(name, {})
+            meta[name] = {**old, "source":old.get("source", "Saved observation"), "status":"Cached"}
+    # Documented dated reference observations, not live quotes. Only US/Colombia.
+    reference = {"United States":5.13, "Colombia":12.70}
+    for name, val in reference.items():
+        if name not in values:
+            values[name] = val
+            meta[name] = {"source":"Dated Trading Economics reference (bundled; not live)", "observed":"Nov/26 (source table updated 2026-11-16)", "url":BONDS, "retrieved":"Not retrieved in this session", "status":"Reference snapshot"}
     return values, meta, checked, "; ".join(errors) or None
 
 
@@ -324,14 +391,15 @@ def parse_oecd_csv(content):
     sector = col("institutional_sector")
     freq = col("freq", "frequency_of_observation")
     measure = col("measure")
-    if not all((area, period, value, targeting, sector, freq, measure)):
+    if not all((area, period, value, targeting, sector, freq)):
         raise ValueError("OECD CSV missing required SDMX dimensions")
     t = frame.copy()
     for c, allowed in ((targeting,{"ST","STATUTORY"}), (sector,{"S13","GENERAL GOVERNMENT"}), (freq,{"A","ANNUAL"})):
         t = t[t[c].astype(str).str.upper().isin(allowed)]
     # Dataset 2.0: measure code is blank for combined rates, as in the OECD
     # query .A..ST..S13... . Reject named measures not indicating combined CIT.
-    t = t[t[measure].isna() | t[measure].astype(str).str.strip().isin(["", "CIT_C", "COMBINED", "Combined corporate income tax rate"])]
+    if measure is not None:
+        t = t[t[measure].isna() | t[measure].astype(str).str.strip().isin(["", "CIT_C", "COMBINED", "Combined corporate income tax rate"])]
     if t.empty:
         return {}
     t["_year"] = pd.to_numeric(t[period], errors="coerce")
@@ -356,7 +424,9 @@ def load_oecd_taxes():
     checked = datetime.now(timezone.utc).isoformat(timespec="minutes")
     errors = []
     try:
-        records = parse_oecd_csv(get(OECD_DATA_API).text)
+        response = requests.get(OECD_DATA_API, headers={"User-Agent":"Mozilla/5.0", "Accept":"csvfile"}, timeout=18)
+        response.raise_for_status()
+        records = parse_oecd_csv(response.text)
         if records:
             return records, "OECD SDMX statutory combined CIT API", checked, None
         errors.append("OECD API: no unambiguous statutory combined country rates")
@@ -420,9 +490,9 @@ with st.sidebar:
     us_auto = us_candidates[0] if us_candidates else None
     local_auto = local_candidates[0] if local_candidates else (us_auto if country == "United States" else None)
     rf_us_pct = st.number_input("U.S. 10-year yield", min_value=-10.0, max_value=100.0, value=float(us_auto) if us_auto is not None else 4.0, step=0.05, format="%.3f", key=f"us_yield_{us_auto}")
-    st.caption((f"{yield_meta['United States']['source']} · observation: {yield_meta['United States']['observed']} · checked: {yield_time}" if us_auto is not None else "Manual starting assumption: 4.0% — NOT verified"))
+    st.caption((f"{yield_meta['United States']['source']} ({yield_meta['United States'].get('status','Retrieved')}) · observation: {yield_meta['United States']['observed']} · checked: {yield_time}" if us_auto is not None else "Manual starting assumption: 4.0% — NOT verified"))
     rf_local_pct = st.number_input(f"{country} 10-year yield", min_value=-10.0, max_value=100.0, value=float(local_auto) if local_auto is not None else 4.0, step=0.05, format="%.3f", key=f"local_yield_{country}_{local_auto}")
-    st.caption((f"{yield_meta[country]['source']} · observation: {yield_meta[country]['observed']} · checked: {yield_time}" if country in yield_meta else "Manual starting assumption: 4.0% — NOT verified"))
+    st.caption((f"{yield_meta[country]['source']} ({yield_meta[country].get('status','Retrieved')}) · observation: {yield_meta[country]['observed']} · checked: {yield_time}" if country in yield_meta else "Manual starting assumption: 4.0% — NOT verified"))
 
     st.markdown("**Credit spread (%)**")
     spread_pct = st.number_input("Baa2/BBB large-firm USD spread", min_value=0.0, max_value=25.0, value=float(spread_auto) if spread_auto is not None else 2.0, step=0.05, format="%.3f", key=f"spread_{spread_auto}")
@@ -440,8 +510,8 @@ with st.expander("Data status and retrieval diagnostics", expanded=False):
     checks = {
         "Industry beta": origin(beta_u, suggested_beta if not betas.empty else None, "Damodaran"),
         "Corporate tax rate": origin(tax_pct, tax_default if tax_entry else None, f"OECD {tax_entry[1]}" if tax_entry else ""),
-        "U.S. 10-year yield": origin(rf_us_pct, us_auto, yield_meta.get("United States",{}).get("source","Market data")),
-        f"{country} 10-year yield": origin(rf_local_pct, local_auto, yield_meta.get(country,{}).get("source","Market data")),
+        "U.S. 10-year yield": origin(rf_us_pct, us_auto, yield_meta.get("United States",{}).get("status","Retrieved") + " · " + yield_meta.get("United States",{}).get("source","Market data")),
+        f"{country} 10-year yield": origin(rf_local_pct, local_auto, yield_meta.get(country,{}).get("status","Retrieved") + " · " + yield_meta.get(country,{}).get("source","Market data")),
         "Baa2/BBB spread": origin(spread_pct, spread_auto, "Damodaran"),
     }
     st.dataframe(pd.DataFrame([{"Input": k, "Data origin": v} for k,v in checks.items()]), hide_index=True, use_container_width=True)
@@ -450,11 +520,14 @@ with st.expander("Data status and retrieval diagnostics", expanded=False):
     for name in ("United States",country):
         if name in yield_meta:
             m = yield_meta[name]
-            st.write(f"{name}: {m['source']} · observation {m['observed']} · retrieved {m['retrieved']} UTC · {m['url']}")
+            st.write(f"{name}: {m.get('status','Retrieved')} · {m['source']} · observation {m['observed']} · retrieved {m['retrieved']} UTC · {m['url']}")
     st.write("Credit spread:", spread_source)
     st.write("OECD tax rates:", tax_error or tax_source)
     st.write("Industry beta:", beta_source)
 missing = [k for k,v in checks.items() if "Manual" in v]
+for label, name in (("U.S. 10-year yield", "United States"), (f"{country} 10-year yield", country)):
+    if yield_meta.get(name, {}).get("status") in {"Cached", "Reference snapshot"} and label not in missing:
+        missing.append(label + " (dated reference/cached observation)")
 if missing:
     st.warning("**Illustrative results:** Manual inputs require independent verification: " + ", ".join(missing) + ".")
 
