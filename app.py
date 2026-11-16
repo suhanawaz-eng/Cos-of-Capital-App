@@ -1,5 +1,5 @@
 """Cost of Capital — USD vs selected local currency (Streamlit)."""
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, timedelta
 from urllib.parse import quote
 from io import BytesIO, StringIO
 import json
@@ -22,12 +22,14 @@ RATINGS = "https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/ratings.h
 BONDS = "https://tradingeconomics.com/country-list/government-bond-10y"
 BONDS_ALT = "https://tradingeconomics.com/bonds"
 BONDS_BACKUP = "https://countryeconomy.com/bonds"
+WGB_CO = "https://www.worldgovernmentbonds.com/country/colombia/"
+TE_CO = "https://tradingeconomics.com/colombia/government-bond-yield"
 CACHE_FILE = Path(__file__).with_name("last_successful_yields.json")
 OECD = "https://www.oecd.org/en/publications/corporate-tax-statistics-2025_6a915941-en/full-report/component-6.html"
 OECD_2024 = "https://www.oecd.org/en/publications/corporate-tax-statistics-2024_9c27d6e8-en/full-report/statutory-corporate-income-tax-rates_440f9286.html"
 
 
-OECD_DATA_API = "https://sdmx.oecd.org/public/rest/data/OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT,2.0/.A..ST..S13...?startPeriod=2023&dimensionAtObservation=AllDimensions"
+OECD_DATA_API = "https://sdmx.oecd.org/public/rest/data/OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT,2.0/.A..ST..S13+S1311+S13M...?startPeriod=2026&dimensionAtObservation=AllDimensions"
 OECD_2026_REPORT = "https://www.oecd.org/en/publications/corporate-tax-statistics-2026_73af6222-en/full-report/statutory-corporate-income-tax-rates_ce84abb9.html"
 FRED_US = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10"
 FRED_CO = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=COLIRLTLT01STM"
@@ -203,6 +205,28 @@ def parse_yield_html(page):
     return out
 
 
+def parse_te_reference_dates(page):
+    """Extract source reference labels from the same country/last table."""
+    dates = {}
+    soup = BeautifulSoup(page, "html.parser")
+    for table in soup.select("table"):
+        rows = table.select("tr")
+        for i, tr in enumerate(rows[:12]):
+            heads = [norm(c.get_text(" ", strip=True)) for c in tr.find_all(["th", "td"], recursive=False)]
+            if "country" not in heads or "reference" not in heads:
+                continue
+            ci, di = heads.index("country"), heads.index("reference")
+            for row in rows[i+1:]:
+                cells = row.find_all(["td", "th"], recursive=False)
+                if len(cells) <= max(ci, di):
+                    continue
+                name = cells[ci].get_text(" ", strip=True)
+                if name in CURRENCIES:
+                    dates[name] = cells[di].get_text(" ", strip=True)
+            break
+    return dates
+
+
 def parse_backup_bonds(page):
     """CountryEconomy explicitly labels 10-year yields and observation dates."""
     soup = BeautifulSoup(page, "html.parser")
@@ -228,6 +252,56 @@ def parse_backup_bonds(page):
                 values[country] = val
                 dates[country] = date_text
     return values, dates
+
+
+def parse_colombia_te_page(page):
+    """Extract only the named 10-year yield, not a forecast or an unrelated tenor."""
+    soup = BeautifulSoup(page, "html.parser")
+    text = soup.get_text(" ", strip=True)
+    patterns = [
+        r"Colombia 10-Year Government Bond Yield\s*[-–]\s*Quote.*?Actual\s+([0-9]{1,2}\.[0-9]{1,4})",
+        r"Colombia 10Y Bond Yield (?:eased|rose|increased|fell|stood|held|climbed|declined) to\s+([0-9]{1,2}\.[0-9]{1,4})%",
+    ]
+    value = None
+    for pat in patterns:
+        m = re.search(pat, text, re.I | re.S)
+        if m:
+            value = float(m.group(1))
+            break
+    if value is None or not 0 < value < 40:
+        raise ValueError("Colombia 10Y actual yield not unambiguously present")
+    date_match = re.search(r"(?:on|as of)\s+(November|December|January|February|March|April|May|June|July|August|September|October)\s+(\d{1,2}),?\s+(20\d{2})", text, re.I)
+    if not date_match:
+        raise ValueError("Colombia yield observation date unavailable")
+    observed = datetime.strptime(" ".join(date_match.groups()), "%B %d %Y").date().isoformat()
+    if date.fromisoformat(observed) > datetime.now(timezone.utc).date():
+        raise ValueError("Future observation date")
+    return value, observed
+
+
+def parse_colombia_wgb(page):
+    """Read the 10-year row and its update day, avoiding other maturities."""
+    soup = BeautifulSoup(page, "html.parser")
+    for tr in soup.select("tr"):
+        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"], recursive=False)]
+        if not cells or norm(cells[0]) not in {"10 years", "10 year"}:
+            continue
+        if len(cells) < 2:
+            continue
+        m = re.search(r"([0-9]{1,2}\.[0-9]{1,4})\s*%", cells[1])
+        if not m:
+            continue
+        value = float(m.group(1))
+        if not 0 < value < 40:
+            continue
+        # A year is required to avoid incorrectly dating a quote around New Year.
+        page_text = soup.get_text(" ", strip=True)
+        updated = re.search(r"Last Update:\s*(\d{1,2})\s+([A-Za-z]{3})\s+(20\d{2})", page_text, re.I)
+        if not updated:
+            raise ValueError("10-year yield found but dated observation unavailable")
+        observed = datetime.strptime(" ".join(updated.groups()), "%d %b %Y").date().isoformat()
+        return value, observed
+    raise ValueError("10-year yield row missing")
 
 
 def read_last_successful_yields():
@@ -301,6 +375,18 @@ def load_yields():
                 errors.append("CountryEconomy: no dated 10-year bond rows recognized")
         except Exception as e:
             errors.append(f"CountryEconomy: {type(e).__name__}: {e}")
+    # Targeted Colombia pages: use actual 10Y observations, with explicit dates.
+    if "Colombia" not in values:
+        for url, parser, source in ((TE_CO, parse_colombia_te_page, "Trading Economics Colombia 10Y"),
+                                    (WGB_CO, parse_colombia_wgb, "World Government Bonds Colombia 10Y")):
+            try:
+                val, observed = parser(get(url).text)
+                values["Colombia"] = val
+                meta["Colombia"] = {"source": source, "observed": observed,
+                                    "url": url, "retrieved": checked, "status": "Retrieved"}
+                break
+            except Exception as e:
+                errors.append(f"{source}: {type(e).__name__}: {e}")
     # FRED only for the two documented series; keep timeouts bounded.
     for name, series, url in (("United States", "DGS10", FRED_US), ("Colombia", "COLIRLTLT01STM", FRED_CO)):
         if name in values:
@@ -311,20 +397,17 @@ def load_yields():
             meta[name] = {"source":f"FRED ({series})", "observed":observed, "url":url, "retrieved":checked, "status":"Retrieved"}
         except Exception as e:
             errors.append(f"FRED {series}: {type(e).__name__}: {e}")
-    if values:
-        save_last_successful_yields(values, meta)
     cached_values, cached_meta = read_last_successful_yields()
+    # Preserve prior observations for other countries; a transient source failure
+    # must not overwrite the previous cache with an incomplete dataset.
+    if values:
+        save_last_successful_yields({**cached_values, **values}, {**cached_meta, **meta})
     for name, val in cached_values.items():
         if name not in values:
             values[name] = val
             old = cached_meta.get(name, {})
             meta[name] = {**old, "source":old.get("source", "Saved observation"), "status":"Cached"}
-    # Documented dated reference observations, not live quotes. Only US/Colombia.
-    reference = {"United States":5.13, "Colombia":12.70}
-    for name, val in reference.items():
-        if name not in values:
-            values[name] = val
-            meta[name] = {"source":"Dated Trading Economics reference (bundled; not live)", "observed":"Nov/26 (source table updated 2026-11-16)", "url":BONDS, "retrieved":"Not retrieved in this session", "status":"Reference snapshot"}
+    # No hardcoded bond yields: failed sources remain explicit manual assumptions.
     return values, meta, checked, "; ".join(errors) or None
 
 
@@ -526,10 +609,20 @@ with st.expander("Data status and retrieval diagnostics", expanded=False):
     st.write("Industry beta:", beta_source)
 missing = [k for k,v in checks.items() if "Manual" in v]
 for label, name in (("U.S. 10-year yield", "United States"), (f"{country} 10-year yield", country)):
-    if yield_meta.get(name, {}).get("status") in {"Cached", "Reference snapshot"} and label not in missing:
-        missing.append(label + " (dated reference/cached observation)")
+    if yield_meta.get(name, {}).get("status") in {"Cached"} and label not in missing:
+        missing.append(label + " (cached observation)")
 if missing:
     st.warning("**Illustrative results:** Manual inputs require independent verification: " + ", ".join(missing) + ".")
+
+# A same-day comparison is preferable; the UI flags differing or unknown dates.
+if country != "United States" and us_auto is not None and local_auto is not None:
+    us_date = str(yield_meta.get("United States", {}).get("observed", ""))
+    local_date = str(yield_meta.get(country, {}).get("observed", ""))
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", us_date) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", local_date):
+        if us_date != local_date:
+            st.warning(f"**Yield date mismatch:** U.S. observation {us_date}; {country} observation {local_date}. For a matched-date comparison, enter yields from the same date manually.")
+    else:
+        st.info("Bond-yield observation dates are not both precise calendar dates; verify date alignment before relying on the comparison.")
 
 r = calculate(beta_u, tax_pct/100, debt_pct/100, erp_pct/100, rf_us_pct/100, rf_local_pct/100, spread_pct/100)
 if country == "United States" and abs(rf_local_pct-rf_us_pct)>1e-8:
