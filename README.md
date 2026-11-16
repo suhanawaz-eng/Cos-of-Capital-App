@@ -88,3 +88,15 @@ Source retrieval timestamps record when a page was fetched, not necessarily when
 The app does not block calculations when public websites fail to return machine-readable data. It displays a prominent **Illustrative results only** warning and labels each manually supplied rate. Default 4% government yields, 2% spread, and 25% tax are **starting assumptions, not verified market data**. Replace them with verified values for a decision. Source diagnostics remain available.
 
 Trading Economics' public HTML layout can change or block automated requests; no-API-key access is not a guarantee of machine-readable data. Damodaran's ratings table can also change. The app intentionally avoids guessing a credit spread from an unlabeled column.
+
+## November 2026 data-retrieval revision
+
+- Trading Economics: the app first parses the public 10-year bond **country list** by its actual `Country`/`Last` columns, then tries an `lxml` table parser. No API key is required. An inaccessible or changed page triggers an explicitly marked manual input; it does **not** silently substitute a live value.
+- Damodaran credit spread: the Baa2/BBB spread is read from the **left-hand, large non-financial firms** rating block. The two rating tables share an HTML table; a `large` label is not repeated in each column. The source analysis date (e.g. January 2026) is distinct from the page fetch date.
+- OECD: the app attempts to extract a country-specific statutory tax rate only from a table that explicitly contains **country, year and statutory rate**. The OECD publications are not guaranteed to provide such a table in HTML; if not, the tax rate remains manual. The displayed fetch time is not the underlying tax year. For a production-grade automatic OECD rate for every country, a validated OECD SDMX dataset mapping is still required.
+- All retrieved values remain editable. Results stay visible; manual assumptions/overrides are flagged, not blocked. Data status and diagnostics are collapsed by default.
+- Public websites may change layouts, deny automated requests, or impose usage restrictions. Check observation dates and source details before making decisions.
+
+### Verification
+
+The Python source was syntax-checked. Live network calls could not be exercised in the build environment, so automatic retrieval in the deployed Streamlit environment still requires validation. No source-derived rates have been hard-coded as live values.

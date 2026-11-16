@@ -1,9 +1,10 @@
 """Cost of Capital — USD vs selected local currency (Streamlit)."""
 from datetime import datetime, timezone
-from io import BytesIO
+from io import BytesIO, StringIO
 import re
 import html
 import unicodedata
+from bs4 import BeautifulSoup
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -17,7 +18,8 @@ BETA_HTML = "https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/Betas.
 RATINGS = "https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/ratings.html"
 BONDS = "https://tradingeconomics.com/country-list/government-bond-10y"
 BONDS_ALT = "https://tradingeconomics.com/bonds"
-OECD = "https://www.oecd.org/en/publications/corporate-tax-statistics-2024_9c27d6e8-en/full-report/statutory-corporate-income-tax-rates_440f9286.html"
+OECD = "https://www.oecd.org/en/publications/corporate-tax-statistics-2025_6a915941-en/full-report/component-6.html"
+OECD_2024 = "https://www.oecd.org/en/publications/corporate-tax-statistics-2024_9c27d6e8-en/full-report/statutory-corporate-income-tax-rates_440f9286.html"
 
 # Currency is the primary circulating currency; countries with multiple legal currencies
 # or unusual bond denominations require manual verification.
@@ -123,24 +125,65 @@ def table_variants(raw):
             yield promoted
 
 
+def _as_tables(page):
+    # StringIO avoids the optional html5lib parser dependency path used by some
+    # pandas/BeautifulSoup versions when given a byte buffer.
+    return pd.read_html(StringIO(page), flavor="lxml")
+
+
 def parse_yield_tables(tables):
-    result = {}
+    """Only accept named country + 'Last' columns, never unrelated indicators."""
+    output = {}
     for raw in tables:
         for t in table_variants(raw):
-            headers = [norm(c) for c in t.columns]
-            ci = next((i for i, h in enumerate(headers) if h in {"country", "country name", "name"} or h.startswith("country ")), None)
-            yi = next((i for i, h in enumerate(headers) if h in {"last", "yield", "yield percent", "last percent", "10y", "10 year", "10 year yield"} or h.startswith("last ")), None)
+            heads = [norm(c) for c in t.columns]
+            ci = next((i for i, h in enumerate(heads) if h in {"country", "country name"}), None)
+            yi = next((i for i, h in enumerate(heads) if h in {"last", "yield", "yield percent", "10y", "10 year yield"}), None)
             if ci is None or yi is None:
                 continue
             for row in t.itertuples(index=False, name=None):
                 name = str(row[ci]).strip()
+                if name not in CURRENCIES and name not in {"Hong Kong", "Taiwan", "Kenya", "Nigeria", "Russia", "Zambia"}:
+                    continue
                 try:
                     val = numeric(row[yi])
                 except (ValueError, TypeError):
                     continue
-                if name and pd.notna(val) and -10 < val < 100:
-                    result[name] = val
-    return result
+                if pd.notna(val) and -5 < val < 75:
+                    output[name] = float(val)
+    return output
+
+
+def parse_yield_html(page):
+    """Handle the public country-list table without relying on pandas headers."""
+    soup = BeautifulSoup(page, "html.parser")
+    out = {}
+    for table in soup.select("table"):
+        rows = table.select("tr")
+        header = []
+        for row in rows[:5]:
+            cells = row.find_all(["th", "td"], recursive=False)
+            vals = [norm(c.get_text(" ", strip=True)) for c in cells]
+            if "country" in vals and "last" in vals:
+                header = vals
+                break
+        if not header:
+            continue
+        ci, yi = header.index("country"), header.index("last")
+        for row in rows:
+            cells = row.find_all(["td", "th"], recursive=False)
+            if len(cells) <= max(ci, yi):
+                continue
+            name = cells[ci].get_text(" ", strip=True)
+            if name not in CURRENCIES:
+                continue
+            try:
+                val = numeric(cells[yi].get_text(" ", strip=True))
+                if -5 < val < 75:
+                    out[name] = val
+            except (TypeError, ValueError):
+                continue
+    return out
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -148,52 +191,106 @@ def load_yields():
     errors = []
     for url in (BONDS, BONDS_ALT):
         try:
-            tables = pd.read_html(BytesIO(get(url).content))
-            output = parse_yield_tables(tables)
-            if len(output) >= 5:
-                return output, url, datetime.now(timezone.utc).isoformat(timespec="minutes"), None
-            errors.append(f"{url}: recognized {len(output)} yields")
+            page = get(url).text
+            parsed = parse_yield_html(page)
+            if len(parsed) < 5:
+                parsed.update(parse_yield_tables(_as_tables(page)))
+            if len(parsed) >= 5 and "United States" in parsed:
+                return parsed, url, datetime.now(timezone.utc).isoformat(timespec="minutes"), None
+            errors.append(f"{url}: found {len(parsed)} supported country yields")
         except Exception as e:
             errors.append(f"{url}: {type(e).__name__}: {e}")
     return {}, None, None, "; ".join(errors)
 
 
-def parse_credit_spread(tables):
-    """Locate the BBB row and a genuinely labeled large-company spread column.
+def parse_credit_spread_html(page):
+    """The left-hand four columns are the large nonfinancial firms table.
 
-    Damodaran frequently presents a two-row heading where the large-company
-    label appears above the actual 'Spread is' column.
+    The current source has two adjacent ratings tables; 'large' is a heading
+    spanning columns, not a label on the actual spread column.
     """
-    for raw in tables:
-        t = flatten_table(raw)
-        # Inspect the raw header and up to five preceding data rows, preserving
-        # the physical column positions (not guessed spread values).
-        header_rows = [[str(c) for c in t.columns]] + [list(map(str, row)) for row in t.head(6).itertuples(index=False, name=None)]
-        for row_index, row in enumerate(t.itertuples(index=False, name=None)):
-            if not any(re.search(r"\b(?:Baa2\s*/\s*BBB|BBB\s*/\s*Baa2)\b", str(x), re.I) for x in row):
+    soup = BeautifulSoup(page, "html.parser")
+    for table in soup.find_all("table"):
+        content = norm(table.get_text(" ", strip=True))
+        if "large non financial service firms" not in content or "financial service firms" not in content:
+            continue
+        for tr in table.find_all("tr"):
+            cells = tr.find_all(["td", "th"], recursive=False)
+            vals = [c.get_text(" ", strip=True) for c in cells]
+            if len(vals) < 4:
                 continue
-            for idx in range(len(row)):
-                context = " ".join(h[idx] for h in header_rows if idx < len(h)).lower()
-                # Require both a spread label and a large-company descriptor.
-                if not ("spread" in context and ("large" in context or "financial service" in context)):
-                    continue
-                try:
-                    value = numeric(row[idx])
-                except (ValueError, TypeError):
-                    continue
-                if pd.notna(value) and 0 <= value <= 25:
-                    return value
-    raise ValueError("BBB large-firm spread column not clearly labeled in downloaded table")
+            # Rating is the third column and spread the fourth in the left block.
+            if norm(vals[2]) == "baa2 bbb":
+                v = numeric(vals[3])
+                if 0 <= v <= 25:
+                    return v
+    # Fallback: some HTML parsers separate the heading from the data table.
+    for t in _as_tables(page):
+        for row in t.itertuples(index=False, name=None):
+            vals = [str(v) for v in row]
+            for i, v in enumerate(vals):
+                if norm(v) == "baa2 bbb" and i >= 2 and i + 1 < len(vals):
+                    spread = numeric(vals[i + 1])
+                    if 0 <= spread <= 25 and i == 2:
+                        return spread
+    raise ValueError("Baa2/BBB row in the large nonfinancial firm columns not found")
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_credit_spread():
     try:
-        tables = pd.read_html(BytesIO(get(RATINGS).content))
-        value = parse_credit_spread(tables)
-        return value, "Damodaran Baa2/BBB (large firms)", datetime.now(timezone.utc).isoformat(timespec="minutes")
+        value = parse_credit_spread_html(get(RATINGS).text)
+        return value, "Damodaran Baa2/BBB (large nonfinancial firms)", datetime.now(timezone.utc).isoformat(timespec="minutes")
     except Exception as e:
         return None, f"{type(e).__name__}: {e}", None
+
+
+def parse_oecd_tax_tables(page):
+    """Strict table extraction: only explicit country, year and statutory rate.
+
+    OECD narrative statistics are NOT a country tax-rate lookup. If the
+    publication contains no machine-readable country/year table, return empty.
+    """
+    records = {}
+    try:
+        tables = _as_tables(page)
+    except Exception:
+        return records
+    for raw in tables:
+        t = flatten_table(raw)
+        heads = [norm(c) for c in t.columns]
+        ci = next((i for i, h in enumerate(heads) if h in {"jurisdiction", "country", "economy", "country name"}), None)
+        yi = next((i for i, h in enumerate(heads) if h in {"year", "time period", "time"}), None)
+        ri = next((i for i, h in enumerate(heads) if "statutory" in h and "rate" in h and "small" not in h), None)
+        if ci is None or ri is None:
+            continue
+        for row in t.itertuples(index=False, name=None):
+            name = str(row[ci]).strip()
+            if name not in CURRENCIES:
+                continue
+            try:
+                rate = numeric(row[ri])
+                year = int(numeric(row[yi])) if yi is not None else None
+            except (ValueError, TypeError, OverflowError):
+                continue
+            if 0 <= rate <= 60 and year and 2020 <= year <= datetime.now().year:
+                if name not in records or year > records[name][1]:
+                    records[name] = (rate, year)
+    return records
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_oecd_taxes():
+    errors = []
+    for url in (OECD, OECD_2024):
+        try:
+            records = parse_oecd_tax_tables(get(url).text)
+            if records:
+                return records, url, datetime.now(timezone.utc).isoformat(timespec="minutes"), None
+            errors.append(f"{url}: no unambiguous country/year/statutory-rate table")
+        except Exception as e:
+            errors.append(f"{url}: {type(e).__name__}: {e}")
+    return {}, None, None, "; ".join(errors)
 
 
 def calculate(beta_u, tax, debt_share, erp, rf_us, rf_local, spread):
@@ -221,6 +318,7 @@ with st.spinner("Checking public sources…"):
     betas, beta_source, beta_time = load_betas()
     yields, yield_source, yield_time, yield_error = load_yields()
     spread_auto, spread_source, spread_time = load_credit_spread()
+    taxes, tax_source, tax_time, tax_error = load_oecd_taxes()
 
 with st.sidebar:
     st.header("Project assumptions")
@@ -235,8 +333,11 @@ with st.sidebar:
 
     st.markdown("**Financing and taxes**")
     debt_pct = st.slider("Target debt share (D / [D + E])", 0, 95, 30)
-    tax_pct = st.number_input("Corporate tax rate (%)", min_value=0.0, max_value=100.0, value=25.0, step=0.5)
-    st.caption("Manual assumption; check the applicable statutory rate and year in OECD data")
+    tax_entry = taxes.get(country)
+    tax_default = float(tax_entry[0]) if tax_entry else 25.0
+    tax_pct = st.number_input("Corporate tax rate (%)", min_value=0.0, max_value=100.0, value=tax_default, step=0.5, key=f"tax_{country}_{tax_default}")
+    tax_edited = abs(tax_pct - tax_default) > 1e-9
+    st.caption((f"OECD statutory rate for {tax_entry[1]}" if tax_entry else "Manual starting assumption — OECD country rate unavailable") + (" · overridden" if tax_edited else ""))
     erp_pct = st.number_input("U.S. equity risk premium (%)", min_value=0.0, max_value=50.0, value=6.5, step=0.1)
 
     st.markdown("**10-year government yields (%)**")
@@ -245,35 +346,39 @@ with st.sidebar:
     us_auto = us_candidates[0] if us_candidates else None
     local_auto = local_candidates[0] if local_candidates else (us_auto if country == "United States" else None)
     rf_us_pct = st.number_input("U.S. 10-year yield", min_value=-10.0, max_value=100.0, value=float(us_auto) if us_auto is not None else 4.0, step=0.05, format="%.3f", key=f"us_yield_{us_auto}")
-    st.caption("Retrieved from Trading Economics" if us_auto is not None else "Manual starting assumption: 4.0% — NOT verified")
+    st.caption("Trading Economics · source checked " + str(yield_time) if us_auto is not None else "Manual starting assumption: 4.0% — NOT verified")
     rf_local_pct = st.number_input(f"{country} 10-year yield", min_value=-10.0, max_value=100.0, value=float(local_auto) if local_auto is not None else 4.0, step=0.05, format="%.3f", key=f"local_yield_{country}_{local_auto}")
-    st.caption("Retrieved from Trading Economics" if local_auto is not None else "Manual starting assumption: 4.0% — NOT verified")
+    st.caption("Trading Economics · source checked " + str(yield_time) if local_auto is not None else "Manual starting assumption: 4.0% — NOT verified")
 
     st.markdown("**Credit spread (%)**")
     spread_pct = st.number_input("Baa2/BBB large-firm USD spread", min_value=0.0, max_value=25.0, value=float(spread_auto) if spread_auto is not None else 2.0, step=0.05, format="%.3f", key=f"spread_{spread_auto}")
-    st.caption("Retrieved from Damodaran" if spread_auto is not None else "Manual starting assumption: 2.0% — NOT verified")
+    st.caption("Damodaran · source checked " + str(spread_time) if spread_auto is not None else "Manual starting assumption: 2.0% — NOT verified")
     st.markdown("[Trading Economics bonds](https://tradingeconomics.com/bonds) · [Damodaran spread](https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/ratings.html) · [OECD tax reference](https://www.oecd.org/en/publications/corporate-tax-statistics-2024_9c27d6e8-en/full-report/statutory-corporate-income-tax-rates_440f9286.html)")
 
 if not currency:
     st.error("Specify a local currency code to continue.")
     st.stop()
 
-st.subheader("Data status")
-checks = {
-    "Industry beta": "Damodaran" if not betas.empty else "Manual assumption",
-    "Corporate tax rate": "Manual assumption (OECD reference)",
-    "U.S. 10-year yield": "Trading Economics" if us_auto is not None else "Manual assumption (unverified)",
-    f"{country} 10-year yield": "Trading Economics" if local_auto is not None else "Manual assumption (unverified)",
-    "Baa2/BBB spread": "Damodaran" if spread_auto is not None else "Manual assumption (unverified)",
-}
-st.dataframe(pd.DataFrame([{"Input": k, "Data origin": v} for k,v in checks.items()]), hide_index=True, use_container_width=True)
+st.subheader("Results")
+with st.expander("Data status and retrieval diagnostics", expanded=False):
+    def origin(value, auto, label):
+        return label if auto is not None and abs(value-auto) < 1e-9 else ("Manual override" if auto is not None else "Manual assumption (unverified)")
+    checks = {
+        "Industry beta": origin(beta_u, suggested_beta if not betas.empty else None, "Damodaran"),
+        "Corporate tax rate": origin(tax_pct, tax_default if tax_entry else None, f"OECD {tax_entry[1]}" if tax_entry else ""),
+        "U.S. 10-year yield": origin(rf_us_pct, us_auto, "Trading Economics"),
+        f"{country} 10-year yield": origin(rf_local_pct, local_auto, "Trading Economics"),
+        "Baa2/BBB spread": origin(spread_pct, spread_auto, "Damodaran"),
+    }
+    st.dataframe(pd.DataFrame([{"Input": k, "Data origin": v} for k,v in checks.items()]), hide_index=True, use_container_width=True)
+    st.caption(f"Industry beta checked: {beta_time or 'unavailable'} · Bond yields checked: {yield_time or 'unavailable'} · Credit spread checked: {spread_time or 'unavailable'} · OECD checked: {tax_time or 'unavailable'} (UTC)")
+    st.write("Bond yields:", yield_error or "Source table retrieved")
+    st.write("Credit spread:", spread_source)
+    st.write("OECD tax rates:", tax_error or tax_source)
+    st.write("Industry beta:", beta_source)
 missing = [k for k,v in checks.items() if "Manual" in v]
 if missing:
-    st.warning("**Illustrative results only.** Some inputs were not retrieved automatically: " + ", ".join(missing) + ". Replace manual starting assumptions with verified values before relying on the output.")
-with st.expander("Source retrieval diagnostics"):
-    st.write("Bond yields:", yield_error or "Source parsed; check coverage and observation dates.")
-    st.write("Credit spread:", spread_source)
-    st.write("Industry beta:", beta_source)
+    st.warning("**Illustrative results:** Manual inputs require independent verification: " + ", ".join(missing) + ".")
 
 r = calculate(beta_u, tax_pct/100, debt_pct/100, erp_pct/100, rf_us_pct/100, rf_local_pct/100, spread_pct/100)
 if country == "United States" and abs(rf_local_pct-rf_us_pct)>1e-8:
@@ -281,7 +386,6 @@ if country == "United States" and abs(rf_local_pct-rf_us_pct)>1e-8:
 if currency == "EUR":
     st.info("For EUR projects, sovereign bond yields may differ across euro-area countries. Verify the appropriate EUR risk-free proxy.")
 
-st.subheader("Results")
 a, b, c = st.columns(3)
 a.metric("Relevered equity beta", f"{r['beta_e']:.3f}")
 b.metric("Debt / equity", f"{r['de']:.3f}")
@@ -336,7 +440,7 @@ with st.expander("Data sources, timestamps, and limitations"):
     st.markdown(f"- [Damodaran U.S. industry beta XLS]({BETA_XLS}) — {beta_source}; retrieved: {beta_time or 'unavailable'}")
     st.markdown(f"- [Damodaran Baa2/BBB spread]({RATINGS}) — {spread_source}; retrieved: {spread_time or 'unavailable'}")
     st.markdown(f"- [Trading Economics 10-year bond yields]({BONDS_ALT}) — retrieval: {yield_time or 'unavailable'}; source: {yield_source or 'unavailable'}; no API key used; public HTML parsing may be blocked or change.")
-    st.markdown(f"- [OECD Corporate Tax Statistics 2024]({OECD}) — reference for **manually entered** statutory tax rate; not live or automatically mapped.")
+    st.markdown(f"- [OECD Corporate Tax Statistics]({OECD}) — {tax_source or 'no validated country-level table found'}; checked: {tax_time or 'unavailable'}. The app only auto-fills tax when an unambiguous country/year/rate table is available; otherwise manual input is required.")
     st.markdown("**Model:** U.S. market beta and 6.5% default U.S. ERP; no additional country equity premium. Assumes debt and tax-shield beta are zero, perpetual debt and fully usable tax deductions, target debt share, and equal real interest rates/relative PPP. Sovereign yields may contain liquidity, term and default premia. 10-year yields are used as proxies and do not guarantee matching project duration. Credit spread is applied in USD before conversion. No claim of exact forward FX rates or no-arbitrage pricing.")
     st.markdown("**Verification:** Results remain visible as illustrative calculations when some inputs are manual. Manually entered values and edits to retrieved inputs are not independently verified; check them before use.\n\n**Freshness:** The timestamps reflect when this app retrieved a web page, not necessarily when its underlying data was last updated. Confirm reference dates at each source. Manual overrides are not independently verified.")
 
