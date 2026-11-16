@@ -100,3 +100,19 @@ Trading Economics' public HTML layout can change or block automated requests; no
 ### Verification
 
 The Python source was syntax-checked. Live network calls could not be exercised in the build environment, so automatic retrieval in the deployed Streamlit environment still requires validation. No source-derived rates have been hard-coded as live values.
+
+## Version 5 — source reliability update
+
+- **10-year yields:** First attempts the public Trading Economics country-list table. If U.S. or Colombia observations are missing, attempts FRED CSV feeds (`DGS10` for U.S. Treasury and `COLIRLTLT01STM` for Colombia, an OECD monthly series). FRED data may be less recent than Trading Economics; the observation date is displayed separately from the retrieval timestamp. Other countries require Trading Economics or manual entry if unavailable.
+- **Corporate taxes:** Attempts OECD's SDMX Corporate Income Tax statutory-rate CSV dataset. The filter requires annual, statutory, general-government, combined corporate rates and a unique country/year observation. If OECD's API cannot be accessed, the 2026 OECD Corporate Tax Statistics publication explicitly confirms **Colombia: 35%**, used as a source-backed country-specific fallback. Other countries without validated API data remain manual rather than using fabricated values.
+- **Credit spread and industry beta:** Existing Damodaran retrieval and formulas are unchanged.
+- **Manual overrides:** Any auto-filled number remains editable. The data-status expander identifies overrides and reports available source observation dates.
+- **Data freshness:** Public website parsing can fail due to anti-bot measures, layout changes, or connectivity. Cached values reflect the last successful fetch in the running Streamlit instance; source reference dates and retrieval timestamps are not interchangeable.
+
+### Source links
+
+- [Trading Economics government bonds](https://tradingeconomics.com/country-list/government-bond-10y)
+- [FRED U.S. 10-year Treasury yield](https://fred.stlouisfed.org/series/DGS10)
+- [FRED Colombia 10-year yield (OECD, monthly)](https://fred.stlouisfed.org/series/COLIRLTLT01STM)
+- [OECD corporate income tax dataset](https://data-explorer.oecd.org/vis?df%5Bag%5D=OECD.CTP.TPS&df%5Bid%5D=DSD_TAX_CIT%40DF_CIT&df%5Bvs%5D=2.0)
+- [OECD Corporate Tax Statistics 2026](https://www.oecd.org/en/publications/corporate-tax-statistics-2026_73af6222-en/full-report/statutory-corporate-income-tax-rates_ce84abb9.html)

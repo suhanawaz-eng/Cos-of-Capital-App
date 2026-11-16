@@ -1,5 +1,6 @@
 """Cost of Capital — USD vs selected local currency (Streamlit)."""
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
+from urllib.parse import quote
 from io import BytesIO, StringIO
 import re
 import html
@@ -20,6 +21,13 @@ BONDS = "https://tradingeconomics.com/country-list/government-bond-10y"
 BONDS_ALT = "https://tradingeconomics.com/bonds"
 OECD = "https://www.oecd.org/en/publications/corporate-tax-statistics-2025_6a915941-en/full-report/component-6.html"
 OECD_2024 = "https://www.oecd.org/en/publications/corporate-tax-statistics-2024_9c27d6e8-en/full-report/statutory-corporate-income-tax-rates_440f9286.html"
+
+
+OECD_DATA_API = "https://sdmx.oecd.org/public/rest/data/OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT,2.0/.A..ST..S13...?startPeriod=2023&dimensionAtObservation=AllDimensions&format=csvfile"
+OECD_2026_REPORT = "https://www.oecd.org/en/publications/corporate-tax-statistics-2026_73af6222-en/full-report/statutory-corporate-income-tax-rates_ce84abb9.html"
+FRED_US = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10"
+FRED_CO = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=COLIRLTLT01STM"
+COUNTRY_ISO = {"Colombia":"COL","United States":"USA","Australia":"AUS","Austria":"AUT","Belgium":"BEL","Brazil":"BRA","Canada":"CAN","Chile":"CHL","China":"CHN","Czech Republic":"CZE","Denmark":"DNK","Finland":"FIN","France":"FRA","Germany":"DEU","Greece":"GRC","Hungary":"HUN","India":"IND","Indonesia":"IDN","Ireland":"IRL","Israel":"ISR","Italy":"ITA","Japan":"JPN","Mexico":"MEX","Netherlands":"NLD","New Zealand":"NZL","Norway":"NOR","Peru":"PER","Poland":"POL","Portugal":"PRT","South Korea":"KOR","Spain":"ESP","Sweden":"SWE","Switzerland":"CHE","Turkey":"TUR","Türkiye":"TUR","United Kingdom":"GBR","South Africa":"ZAF","Singapore":"SGP","Malaysia":"MYS","Thailand":"THA"}
 
 # Currency is the primary circulating currency; countries with multiple legal currencies
 # or unusual bond denominations require manual verification.
@@ -155,13 +163,16 @@ def parse_yield_tables(tables):
 
 
 def parse_yield_html(page):
-    """Handle the public country-list table without relying on pandas headers."""
+    """Extract only explicit country + 10-year yield rows from public tables.
+
+    Avoid arbitrary page numbers, forecast values, and unrelated bond maturities.
+    """
     soup = BeautifulSoup(page, "html.parser")
     out = {}
     for table in soup.select("table"):
         rows = table.select("tr")
         header = []
-        for row in rows[:5]:
+        for row in rows[:8]:
             cells = row.find_all(["th", "td"], recursive=False)
             vals = [norm(c.get_text(" ", strip=True)) for c in cells]
             if "country" in vals and "last" in vals:
@@ -186,21 +197,68 @@ def parse_yield_html(page):
     return out
 
 
+def parse_te_reference_dates(page):
+    """Read the country table's Reference column, if provided."""
+    soup = BeautifulSoup(page, "html.parser")
+    dates = {}
+    for table in soup.select("table"):
+        for row in table.select("tr"):
+            cells = row.find_all(["th", "td"], recursive=False)
+            values = [c.get_text(" ", strip=True) for c in cells]
+            if len(values) >= 4 and values[0] in CURRENCIES and re.fullmatch(r"[A-Za-z]{3}/\d{2,4}", values[3]):
+                dates[values[0]] = values[3]
+    return dates
+
+
+def parse_fred_csv(content, series_id):
+    frame = pd.read_csv(StringIO(content))
+    if series_id not in frame.columns or frame.empty:
+        raise ValueError(f"FRED series {series_id} missing")
+    date_col = frame.columns[0]
+    values = pd.to_numeric(frame[series_id], errors="coerce")
+    dates = pd.to_datetime(frame[date_col], errors="coerce")
+    good = pd.DataFrame({"date": dates, "yield": values}).dropna().sort_values("date")
+    good = good[(good["yield"] > -5) & (good["yield"] < 75)]
+    if good.empty:
+        raise ValueError(f"FRED series {series_id} has no valid observations")
+    latest = good.iloc[-1]
+    return float(latest["yield"]), latest["date"].date().isoformat()
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_yields():
+    """Trading Economics public table first; independent FRED fallback for US/CO.
+
+    Return observation date when known; never confuse retrieval time with it.
+    """
     errors = []
+    values, meta = {}, {}
+    checked = datetime.now(timezone.utc).isoformat(timespec="minutes")
     for url in (BONDS, BONDS_ALT):
         try:
             page = get(url).text
             parsed = parse_yield_html(page)
             if len(parsed) < 5:
                 parsed.update(parse_yield_tables(_as_tables(page)))
-            if len(parsed) >= 5 and "United States" in parsed:
-                return parsed, url, datetime.now(timezone.utc).isoformat(timespec="minutes"), None
-            errors.append(f"{url}: found {len(parsed)} supported country yields")
+            if parsed:
+                reference_dates = parse_te_reference_dates(page)
+                for name, val in parsed.items():
+                    values[name] = val
+                    meta[name] = {"source":"Trading Economics", "observed":reference_dates.get(name, "See source reference column"), "url":url, "retrieved":checked}
+                break
+            errors.append(f"{url}: no country/yield table found")
         except Exception as e:
             errors.append(f"{url}: {type(e).__name__}: {e}")
-    return {}, None, None, "; ".join(errors)
+    for name, series, url in (("United States", "DGS10", FRED_US), ("Colombia", "COLIRLTLT01STM", FRED_CO)):
+        if name in values:
+            continue
+        try:
+            value, observed = parse_fred_csv(get(url).text, series)
+            values[name] = value
+            meta[name] = {"source":f"FRED ({series}; US Treasury/OECD)", "observed":observed, "url":url, "retrieved":checked}
+        except Exception as e:
+            errors.append(f"FRED {series}: {type(e).__name__}: {e}")
+    return values, meta, checked, "; ".join(errors) or None
 
 
 def parse_credit_spread_html(page):
@@ -245,52 +303,68 @@ def load_credit_spread():
         return None, f"{type(e).__name__}: {e}", None
 
 
-def parse_oecd_tax_tables(page):
-    """Strict table extraction: only explicit country, year and statutory rate.
+def parse_oecd_csv(content):
+    """OECD SDMX statutory combined general-government CIT rates only.
 
-    OECD narrative statistics are NOT a country tax-rate lookup. If the
-    publication contains no machine-readable country/year table, return empty.
+    Reject small-business, subcentral-only, effective, and other measures.
     """
-    records = {}
-    try:
-        tables = _as_tables(page)
-    except Exception:
-        return records
-    for raw in tables:
-        t = flatten_table(raw)
-        heads = [norm(c) for c in t.columns]
-        ci = next((i for i, h in enumerate(heads) if h in {"jurisdiction", "country", "economy", "country name"}), None)
-        yi = next((i for i, h in enumerate(heads) if h in {"year", "time period", "time"}), None)
-        ri = next((i for i, h in enumerate(heads) if "statutory" in h and "rate" in h and "small" not in h), None)
-        if ci is None or ri is None:
+    frame = pd.read_csv(StringIO(content), low_memory=False)
+    if frame.empty:
+        return {}
+    cols = {norm(c).replace(" ", "_"): c for c in frame.columns}
+    def col(*names):
+        for name in names:
+            if name in cols:
+                return cols[name]
+        return None
+    area = col("ref_area", "reference_area")
+    period = col("time_period")
+    value = col("obs_value", "observation_value")
+    targeting = col("targeting")
+    sector = col("institutional_sector")
+    freq = col("freq", "frequency_of_observation")
+    measure = col("measure")
+    if not all((area, period, value, targeting, sector, freq, measure)):
+        raise ValueError("OECD CSV missing required SDMX dimensions")
+    t = frame.copy()
+    for c, allowed in ((targeting,{"ST","STATUTORY"}), (sector,{"S13","GENERAL GOVERNMENT"}), (freq,{"A","ANNUAL"})):
+        t = t[t[c].astype(str).str.upper().isin(allowed)]
+    # Dataset 2.0: measure code is blank for combined rates, as in the OECD
+    # query .A..ST..S13... . Reject named measures not indicating combined CIT.
+    t = t[t[measure].isna() | t[measure].astype(str).str.strip().isin(["", "CIT_C", "COMBINED", "Combined corporate income tax rate"])]
+    if t.empty:
+        return {}
+    t["_year"] = pd.to_numeric(t[period], errors="coerce")
+    t["_value"] = pd.to_numeric(t[value], errors="coerce")
+    t = t[(t["_year"] >= 2020) & (t["_year"] <= datetime.now().year) & t["_value"].between(0,60)]
+    reverse = {v:k for k,v in COUNTRY_ISO.items()}
+    out = {}
+    for code, group in t.groupby(area):
+        name = reverse.get(str(code).upper())
+        if not name:
             continue
-        for row in t.itertuples(index=False, name=None):
-            name = str(row[ci]).strip()
-            if name not in CURRENCIES:
-                continue
-            try:
-                rate = numeric(row[ri])
-                year = int(numeric(row[yi])) if yi is not None else None
-            except (ValueError, TypeError, OverflowError):
-                continue
-            if 0 <= rate <= 60 and year and 2020 <= year <= datetime.now().year:
-                if name not in records or year > records[name][1]:
-                    records[name] = (rate, year)
-    return records
+        latest = group.sort_values("_year").iloc[-1]
+        # A unique statutory combined rate must exist for this country/year.
+        matches = group[group["_year"] == latest["_year"]]["_value"].unique()
+        if len(matches) == 1:
+            out[name] = (float(latest["_value"]), int(latest["_year"]))
+    return out
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_oecd_taxes():
+    checked = datetime.now(timezone.utc).isoformat(timespec="minutes")
     errors = []
-    for url in (OECD, OECD_2024):
-        try:
-            records = parse_oecd_tax_tables(get(url).text)
-            if records:
-                return records, url, datetime.now(timezone.utc).isoformat(timespec="minutes"), None
-            errors.append(f"{url}: no unambiguous country/year/statutory-rate table")
-        except Exception as e:
-            errors.append(f"{url}: {type(e).__name__}: {e}")
-    return {}, None, None, "; ".join(errors)
+    try:
+        records = parse_oecd_csv(get(OECD_DATA_API).text)
+        if records:
+            return records, "OECD SDMX statutory combined CIT API", checked, None
+        errors.append("OECD API: no unambiguous statutory combined country rates")
+    except Exception as e:
+        errors.append(f"OECD API: {type(e).__name__}: {e}")
+    # Verified 2026 OECD report country-specific fallback. Not a generic
+    # inferred rate for other countries; other missing rates stay manual.
+    return {"Colombia": (35.0, 2026)}, "OECD Corporate Tax Statistics 2026 (published report; Colombia only)", checked, "; ".join(errors)
 
 
 def calculate(beta_u, tax, debt_share, erp, rf_us, rf_local, spread):
@@ -316,7 +390,7 @@ st.title("Cost of Capital")
 st.caption("U.S.-market CAPM benchmark • USD vs selected local currency • perpetual-debt tax shield")
 with st.spinner("Checking public sources…"):
     betas, beta_source, beta_time = load_betas()
-    yields, yield_source, yield_time, yield_error = load_yields()
+    yields, yield_meta, yield_time, yield_error = load_yields()
     spread_auto, spread_source, spread_time = load_credit_spread()
     taxes, tax_source, tax_time, tax_error = load_oecd_taxes()
 
@@ -346,9 +420,9 @@ with st.sidebar:
     us_auto = us_candidates[0] if us_candidates else None
     local_auto = local_candidates[0] if local_candidates else (us_auto if country == "United States" else None)
     rf_us_pct = st.number_input("U.S. 10-year yield", min_value=-10.0, max_value=100.0, value=float(us_auto) if us_auto is not None else 4.0, step=0.05, format="%.3f", key=f"us_yield_{us_auto}")
-    st.caption("Trading Economics · source checked " + str(yield_time) if us_auto is not None else "Manual starting assumption: 4.0% — NOT verified")
+    st.caption((f"{yield_meta['United States']['source']} · observation: {yield_meta['United States']['observed']} · checked: {yield_time}" if us_auto is not None else "Manual starting assumption: 4.0% — NOT verified"))
     rf_local_pct = st.number_input(f"{country} 10-year yield", min_value=-10.0, max_value=100.0, value=float(local_auto) if local_auto is not None else 4.0, step=0.05, format="%.3f", key=f"local_yield_{country}_{local_auto}")
-    st.caption("Trading Economics · source checked " + str(yield_time) if local_auto is not None else "Manual starting assumption: 4.0% — NOT verified")
+    st.caption((f"{yield_meta[country]['source']} · observation: {yield_meta[country]['observed']} · checked: {yield_time}" if country in yield_meta else "Manual starting assumption: 4.0% — NOT verified"))
 
     st.markdown("**Credit spread (%)**")
     spread_pct = st.number_input("Baa2/BBB large-firm USD spread", min_value=0.0, max_value=25.0, value=float(spread_auto) if spread_auto is not None else 2.0, step=0.05, format="%.3f", key=f"spread_{spread_auto}")
@@ -366,13 +440,17 @@ with st.expander("Data status and retrieval diagnostics", expanded=False):
     checks = {
         "Industry beta": origin(beta_u, suggested_beta if not betas.empty else None, "Damodaran"),
         "Corporate tax rate": origin(tax_pct, tax_default if tax_entry else None, f"OECD {tax_entry[1]}" if tax_entry else ""),
-        "U.S. 10-year yield": origin(rf_us_pct, us_auto, "Trading Economics"),
-        f"{country} 10-year yield": origin(rf_local_pct, local_auto, "Trading Economics"),
+        "U.S. 10-year yield": origin(rf_us_pct, us_auto, yield_meta.get("United States",{}).get("source","Market data")),
+        f"{country} 10-year yield": origin(rf_local_pct, local_auto, yield_meta.get(country,{}).get("source","Market data")),
         "Baa2/BBB spread": origin(spread_pct, spread_auto, "Damodaran"),
     }
     st.dataframe(pd.DataFrame([{"Input": k, "Data origin": v} for k,v in checks.items()]), hide_index=True, use_container_width=True)
     st.caption(f"Industry beta checked: {beta_time or 'unavailable'} · Bond yields checked: {yield_time or 'unavailable'} · Credit spread checked: {spread_time or 'unavailable'} · OECD checked: {tax_time or 'unavailable'} (UTC)")
-    st.write("Bond yields:", yield_error or "Source table retrieved")
+    st.write("Bond yields:", yield_error or "Source data retrieved")
+    for name in ("United States",country):
+        if name in yield_meta:
+            m = yield_meta[name]
+            st.write(f"{name}: {m['source']} · observation {m['observed']} · retrieved {m['retrieved']} UTC · {m['url']}")
     st.write("Credit spread:", spread_source)
     st.write("OECD tax rates:", tax_error or tax_source)
     st.write("Industry beta:", beta_source)
@@ -439,8 +517,8 @@ Under the specified equal-real-rate/relative-PPP assumption, the **same F** conv
 with st.expander("Data sources, timestamps, and limitations"):
     st.markdown(f"- [Damodaran U.S. industry beta XLS]({BETA_XLS}) — {beta_source}; retrieved: {beta_time or 'unavailable'}")
     st.markdown(f"- [Damodaran Baa2/BBB spread]({RATINGS}) — {spread_source}; retrieved: {spread_time or 'unavailable'}")
-    st.markdown(f"- [Trading Economics 10-year bond yields]({BONDS_ALT}) — retrieval: {yield_time or 'unavailable'}; source: {yield_source or 'unavailable'}; no API key used; public HTML parsing may be blocked or change.")
-    st.markdown(f"- [OECD Corporate Tax Statistics]({OECD}) — {tax_source or 'no validated country-level table found'}; checked: {tax_time or 'unavailable'}. The app only auto-fills tax when an unambiguous country/year/rate table is available; otherwise manual input is required.")
+    st.markdown(f"- [Trading Economics 10-year bond yields]({BONDS_ALT}) (public table) and [FRED]({FRED_CO}) (fallback for US/Colombia); checked {yield_time or 'unavailable'}. Observation dates appear in the sidebar when available.")
+    st.markdown(f"- [OECD statutory CIT dataset]({OECD_DATA_API}) / [OECD 2026 report]({OECD_2026_REPORT}) — {tax_source}; checked: {tax_time or 'unavailable'}. Other countries without validated rates use manual inputs.")
     st.markdown("**Model:** U.S. market beta and 6.5% default U.S. ERP; no additional country equity premium. Assumes debt and tax-shield beta are zero, perpetual debt and fully usable tax deductions, target debt share, and equal real interest rates/relative PPP. Sovereign yields may contain liquidity, term and default premia. 10-year yields are used as proxies and do not guarantee matching project duration. Credit spread is applied in USD before conversion. No claim of exact forward FX rates or no-arbitrage pricing.")
     st.markdown("**Verification:** Results remain visible as illustrative calculations when some inputs are manual. Manually entered values and edits to retrieved inputs are not independently verified; check them before use.\n\n**Freshness:** The timestamps reflect when this app retrieved a web page, not necessarily when its underlying data was last updated. Confirm reference dates at each source. Manual overrides are not independently verified.")
 
