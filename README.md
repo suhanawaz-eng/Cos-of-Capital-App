@@ -81,3 +81,10 @@ The app attempts both Trading Economics public bond-table URLs and parses multip
 When a beta, government yield, or credit spread is unavailable, the sidebar shows an editable example value with a **required verification checkbox**. The app **does not display cost-of-capital results until every missing-source input is confirmed**. Corporate tax rates are **always manually verified** against the linked OECD reference because the report is not a live country-rate API. Check the applicable jurisdiction and year. Source diagnostics are displayed if the app cannot calculate.
 
 Source retrieval timestamps record when a page was fetched, not necessarily when the underlying observation was published. A confirmed manual entry is not independently verified by the application. For real financial decisions, independently check all inputs, including any edits to automatically populated fields.
+
+
+## Revised fallback behavior (November 2026)
+
+The app does not block calculations when public websites fail to return machine-readable data. It displays a prominent **Illustrative results only** warning and labels each manually supplied rate. Default 4% government yields, 2% spread, and 25% tax are **starting assumptions, not verified market data**. Replace them with verified values for a decision. Source diagnostics remain available.
+
+Trading Economics' public HTML layout can change or block automated requests; no-API-key access is not a guarantee of machine-readable data. Damodaran's ratings table can also change. The app intentionally avoids guessing a credit spread from an unlabeled column.

@@ -2,6 +2,7 @@
 from datetime import datetime, timezone
 from io import BytesIO
 import re
+import html
 import unicodedata
 
 import pandas as pd
@@ -158,22 +159,23 @@ def load_yields():
 
 
 def parse_credit_spread(tables):
-    """Read only a clearly labeled large-firm Baa2/BBB spread, never a guessed column."""
+    """Locate the BBB row and a genuinely labeled large-company spread column.
+
+    Damodaran frequently presents a two-row heading where the large-company
+    label appears above the actual 'Spread is' column.
+    """
     for raw in tables:
-        for t in table_variants(raw):
-            headers = [norm(c) for c in t.columns]
-            # In Damodaran's ratings table, the large-firm spread is typically
-            # the final 'Spread is' column, but positional inference is unsafe.
-            large = [i for i, h in enumerate(headers) if "large" in h and ("spread" in h or "firm" in h)]
-            explicit = [i for i, h in enumerate(headers) if "spread" in h and ("large" in h or "financial service" in h)]
-            indices = list(dict.fromkeys(explicit or large))
-            # Headers sometimes split across rows: use nearby header text to
-            # establish which spread is large-firm, never an arbitrary number.
-            if len(indices) != 1:
+        t = flatten_table(raw)
+        # Inspect the raw header and up to five preceding data rows, preserving
+        # the physical column positions (not guessed spread values).
+        header_rows = [[str(c) for c in t.columns]] + [list(map(str, row)) for row in t.head(6).itertuples(index=False, name=None)]
+        for row_index, row in enumerate(t.itertuples(index=False, name=None)):
+            if not any(re.search(r"\b(?:Baa2\s*/\s*BBB|BBB\s*/\s*Baa2)\b", str(x), re.I) for x in row):
                 continue
-            idx = indices[0]
-            for row in t.itertuples(index=False, name=None):
-                if not any(re.search(r"\bBaa2\s*/\s*BBB\b", str(x), re.I) for x in row):
+            for idx in range(len(row)):
+                context = " ".join(h[idx] for h in header_rows if idx < len(h)).lower()
+                # Require both a spread label and a large-company descriptor.
+                if not ("spread" in context and ("large" in context or "financial service" in context)):
                     continue
                 try:
                     value = numeric(row[idx])
@@ -181,7 +183,7 @@ def parse_credit_spread(tables):
                     continue
                 if pd.notna(value) and 0 <= value <= 25:
                     return value
-    raise ValueError("No unambiguous Baa2/BBB large-firm spread header/row found")
+    raise ValueError("BBB large-firm spread column not clearly labeled in downloaded table")
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -224,21 +226,17 @@ with st.sidebar:
     st.header("Project assumptions")
     countries = sorted(set(CURRENCIES) | set(yields))
     country = st.selectbox("Project country", countries, index=countries.index("Colombia") if "Colombia" in countries else 0)
-    currency = CURRENCIES.get(country, "")
-    if not currency:
-        currency = st.text_input("Local currency ISO code", value="").strip().upper()
+    currency = CURRENCIES.get(country, "") or st.text_input("Local currency ISO code", value="").strip().upper()
     st.caption(f"Project currency: {currency or 'Not specified'}")
     industry = st.selectbox("U.S. industry", betas["Industry"].tolist() if not betas.empty else ["Manual beta"], disabled=betas.empty)
     suggested_beta = float(betas.set_index("Industry").loc[industry, "Unlevered beta"]) if not betas.empty else 1.0
     beta_u = st.number_input("Unlevered industry beta", min_value=0.01, max_value=10.0, value=suggested_beta, step=0.05, format="%.3f")
-    beta_confirm = True if not betas.empty else st.checkbox("I verified the manually entered unlevered beta")
-    st.caption("Beta: " + ("Retrieved from Damodaran; editable" if not betas.empty else "Manual entry — confirmation required"))
+    st.caption("Damodaran industry beta" if not betas.empty else "Beta unavailable; using editable manual assumption")
 
     st.markdown("**Financing and taxes**")
     debt_pct = st.slider("Target debt share (D / [D + E])", 0, 95, 30)
     tax_pct = st.number_input("Corporate tax rate (%)", min_value=0.0, max_value=100.0, value=25.0, step=0.5)
-    tax_confirm = st.checkbox("I verified the corporate tax rate for this country and tax year")
-    st.caption("Manual OECD-based assumption; 25% is NOT a retrieved tax rate.")
+    st.caption("Manual assumption; check the applicable statutory rate and year in OECD data")
     erp_pct = st.number_input("U.S. equity risk premium (%)", min_value=0.0, max_value=50.0, value=6.5, step=0.1)
 
     st.markdown("**10-year government yields (%)**")
@@ -246,42 +244,36 @@ with st.sidebar:
     local_candidates = [v for k, v in yields.items() if norm(k) == norm(country)]
     us_auto = us_candidates[0] if us_candidates else None
     local_auto = local_candidates[0] if local_candidates else (us_auto if country == "United States" else None)
-    rf_us_pct = st.number_input("U.S. 10-year yield", min_value=-10.0, max_value=100.0, value=float(us_auto) if us_auto is not None else 4.0, step=0.05, format="%.3f")
-    us_confirm = True if us_auto is not None else st.checkbox("I verified the manually entered U.S. yield")
-    st.caption("U.S. yield: " + ("Retrieved; editable" if us_auto is not None else "4% placeholder — verify and confirm"))
-    rf_local_pct = st.number_input(f"{country} 10-year yield", min_value=-10.0, max_value=100.0, value=float(local_auto) if local_auto is not None else 4.0, step=0.05, format="%.3f")
-    local_confirm = True if local_auto is not None else st.checkbox(f"I verified the manually entered {country} yield")
-    st.caption("Local yield: " + ("Retrieved; editable" if local_auto is not None else "4% placeholder — verify and confirm"))
+    rf_us_pct = st.number_input("U.S. 10-year yield", min_value=-10.0, max_value=100.0, value=float(us_auto) if us_auto is not None else 4.0, step=0.05, format="%.3f", key=f"us_yield_{us_auto}")
+    st.caption("Retrieved from Trading Economics" if us_auto is not None else "Manual starting assumption: 4.0% — NOT verified")
+    rf_local_pct = st.number_input(f"{country} 10-year yield", min_value=-10.0, max_value=100.0, value=float(local_auto) if local_auto is not None else 4.0, step=0.05, format="%.3f", key=f"local_yield_{country}_{local_auto}")
+    st.caption("Retrieved from Trading Economics" if local_auto is not None else "Manual starting assumption: 4.0% — NOT verified")
 
     st.markdown("**Credit spread (%)**")
-    spread_pct = st.number_input("Baa2/BBB large-firm USD spread", min_value=0.0, max_value=25.0, value=float(spread_auto) if spread_auto is not None else 2.0, step=0.05, format="%.3f")
-    spread_confirm = True if spread_auto is not None else st.checkbox("I verified the manually entered BBB spread")
-    st.caption("Spread: " + ("Retrieved from Damodaran; editable" if spread_auto is not None else "2% placeholder — verify and confirm"))
+    spread_pct = st.number_input("Baa2/BBB large-firm USD spread", min_value=0.0, max_value=25.0, value=float(spread_auto) if spread_auto is not None else 2.0, step=0.05, format="%.3f", key=f"spread_{spread_auto}")
+    st.caption("Retrieved from Damodaran" if spread_auto is not None else "Manual starting assumption: 2.0% — NOT verified")
+    st.markdown("[Trading Economics bonds](https://tradingeconomics.com/bonds) · [Damodaran spread](https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/ratings.html) · [OECD tax reference](https://www.oecd.org/en/publications/corporate-tax-statistics-2024_9c27d6e8-en/full-report/statutory-corporate-income-tax-rates_440f9286.html)")
 
 if not currency:
     st.error("Specify a local currency code to continue.")
     st.stop()
-if rf_us_pct <= -100 or rf_local_pct <= -100:
-    st.error("Gross government yields must be positive.")
-    st.stop()
 
-st.subheader("Input verification")
+st.subheader("Data status")
 checks = {
-    "Industry beta": (beta_confirm, "Damodaran" if not betas.empty else "Manual"),
-    "Corporate tax rate": (tax_confirm, "Manual OECD reference"),
-    "U.S. 10-year yield": (us_confirm, "Trading Economics" if us_auto is not None else "Manual"),
-    f"{country} 10-year yield": (local_confirm, "Trading Economics" if local_auto is not None else "Manual"),
-    "Baa2/BBB spread": (spread_confirm, "Damodaran" if spread_auto is not None else "Manual"),
+    "Industry beta": "Damodaran" if not betas.empty else "Manual assumption",
+    "Corporate tax rate": "Manual assumption (OECD reference)",
+    "U.S. 10-year yield": "Trading Economics" if us_auto is not None else "Manual assumption (unverified)",
+    f"{country} 10-year yield": "Trading Economics" if local_auto is not None else "Manual assumption (unverified)",
+    "Baa2/BBB spread": "Damodaran" if spread_auto is not None else "Manual assumption (unverified)",
 }
-status = pd.DataFrame([{"Input": k, "Source": source, "Status": "Confirmed" if confirmed else "Needs verification"} for k, (confirmed, source) in checks.items()])
-st.dataframe(status, hide_index=True, use_container_width=True)
-if not all(v[0] for v in checks.values()):
-    st.warning("Results are paused: confirm every manually supplied rate in the sidebar. Placeholder values are not verified market data.")
-    with st.expander("Source retrieval diagnostics"):
-        st.write("Bond yields:", yield_error or "Source parsed successfully; verify that both selected countries appear in its table.")
-        st.write("Credit spread:", spread_source)
-        st.write("Industry beta:", beta_source)
-    st.stop()
+st.dataframe(pd.DataFrame([{"Input": k, "Data origin": v} for k,v in checks.items()]), hide_index=True, use_container_width=True)
+missing = [k for k,v in checks.items() if "Manual" in v]
+if missing:
+    st.warning("**Illustrative results only.** Some inputs were not retrieved automatically: " + ", ".join(missing) + ". Replace manual starting assumptions with verified values before relying on the output.")
+with st.expander("Source retrieval diagnostics"):
+    st.write("Bond yields:", yield_error or "Source parsed; check coverage and observation dates.")
+    st.write("Credit spread:", spread_source)
+    st.write("Industry beta:", beta_source)
 
 r = calculate(beta_u, tax_pct/100, debt_pct/100, erp_pct/100, rf_us_pct/100, rf_local_pct/100, spread_pct/100)
 if country == "United States" and abs(rf_local_pct-rf_us_pct)>1e-8:
@@ -343,10 +335,10 @@ Under the specified equal-real-rate/relative-PPP assumption, the **same F** conv
 with st.expander("Data sources, timestamps, and limitations"):
     st.markdown(f"- [Damodaran U.S. industry beta XLS]({BETA_XLS}) — {beta_source}; retrieved: {beta_time or 'unavailable'}")
     st.markdown(f"- [Damodaran Baa2/BBB spread]({RATINGS}) — {spread_source}; retrieved: {spread_time or 'unavailable'}")
-    st.markdown(f"- [Trading Economics 10-year bond yields]({BONDS_ALT}) — retrieval: {yield_time or "unavailable"}; source: {yield_source or "unavailable"}; no API key used; public HTML parsing may be blocked or change.")
+    st.markdown(f"- [Trading Economics 10-year bond yields]({BONDS_ALT}) — retrieval: {yield_time or 'unavailable'}; source: {yield_source or 'unavailable'}; no API key used; public HTML parsing may be blocked or change.")
     st.markdown(f"- [OECD Corporate Tax Statistics 2024]({OECD}) — reference for **manually entered** statutory tax rate; not live or automatically mapped.")
     st.markdown("**Model:** U.S. market beta and 6.5% default U.S. ERP; no additional country equity premium. Assumes debt and tax-shield beta are zero, perpetual debt and fully usable tax deductions, target debt share, and equal real interest rates/relative PPP. Sovereign yields may contain liquidity, term and default premia. 10-year yields are used as proxies and do not guarantee matching project duration. Credit spread is applied in USD before conversion. No claim of exact forward FX rates or no-arbitrage pricing.")
-    st.markdown("**Verification:** The results are shown only after any missing-source inputs and the manually entered tax rate have been explicitly confirmed. Edits to retrieved inputs should also be verified.\n\n**Freshness:** The timestamps reflect when this app retrieved a web page, not necessarily when its underlying data was last updated. Confirm reference dates at each source. Manual overrides are not independently verified.")
+    st.markdown("**Verification:** Results remain visible as illustrative calculations when some inputs are manual. Manually entered values and edits to retrieved inputs are not independently verified; check them before use.\n\n**Freshness:** The timestamps reflect when this app retrieved a web page, not necessarily when its underlying data was last updated. Confirm reference dates at each source. Manual overrides are not independently verified.")
 
 csv = result.to_csv(index=False).encode("utf-8")
 st.download_button("Download comparison (CSV)", data=csv, file_name="cost_of_capital_comparison.csv", mime="text/csv")
