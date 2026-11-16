@@ -73,3 +73,11 @@ Let `d = D/(D+E)` be target debt share, `τ` tax rate, `βU` industry unlevered 
 ## Troubleshooting
 
 If source retrieval fails, enter verified rates and beta manually in the sidebar. If GitHub deployment fails, inspect the Streamlit logs for missing packages or upstream HTTP errors. The app uses no API keys or Streamlit secrets.
+
+## Data retrieval and verification safeguards (updated)
+
+The app attempts both Trading Economics public bond-table URLs and parses multiple common table layouts. It attempts the Damodaran ratings table and accepts the BBB spread only if the large-firm column can be identified unambiguously. Websites may change or block automated access; **no API key is required, but access is not guaranteed**.
+
+When a beta, government yield, or credit spread is unavailable, the sidebar shows an editable example value with a **required verification checkbox**. The app **does not display cost-of-capital results until every missing-source input is confirmed**. Corporate tax rates are **always manually verified** against the linked OECD reference because the report is not a live country-rate API. Check the applicable jurisdiction and year. Source diagnostics are displayed if the app cannot calculate.
+
+Source retrieval timestamps record when a page was fetched, not necessarily when the underlying observation was published. A confirmed manual entry is not independently verified by the application. For real financial decisions, independently check all inputs, including any edits to automatically populated fields.
